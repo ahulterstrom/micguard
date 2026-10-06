@@ -17,6 +17,8 @@ When you connect Bluetooth headphones, macOS makes their mic the default input. 
 
 MicGuard listens for CoreAudio's "default input changed" and "devices changed" events. Whenever the default input is a Bluetooth device, it switches it back to the Mac's built-in microphone. It's event-driven (no polling) and identifies devices by transport type, so it works with any Bluetooth headphones — Bose, AirPods, Sony, etc. — regardless of name or system language. Non-Bluetooth mics you choose on purpose (USB, audio interfaces) are left alone.
 
+**Lid closed (clamshell mode):** MacBooks disconnect the built-in mic in hardware while the lid is shut — it still appears in the device list but records silence. MicGuard detects this and switches to another wired mic if one is connected; if not, it lets the Bluetooth mic be used, since call-quality audio beats a dead mic. When you open the lid it switches back to the built-in mic.
+
 Menu:
 
 - **Microphone:** the current default input, plus the last time MicGuard switched away from a Bluetooth mic
@@ -35,6 +37,16 @@ cd micguard
 ```
 
 `build.sh` compiles the app, ad-hoc signs it, installs it to `/Applications/MicGuard.app`, and launches it. Run it again after any change to rebuild and reinstall.
+
+## Testing
+
+With MicGuard running and Bluetooth headphones connected:
+
+```bash
+swift scripts/selftest.swift
+```
+
+The self-test sets the default input the way macOS does (Bluetooth mic, built-in mic, other wired mics), then checks that MicGuard switches — or doesn't — as expected, both immediately and after a few seconds. It restores your original mic when it finishes and exits non-zero if anything fails. Lid-open and lid-closed behavior differ, so run it once each way. Avoid recording anything while it runs, since it briefly changes your mic.
 
 ## Tips
 

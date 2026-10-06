@@ -4,6 +4,7 @@
 
 import AppKit
 import CoreAudio
+import IOKit
 
 // MARK: - CoreAudio helpers
 
@@ -68,14 +69,38 @@ enum Audio {
         return type == kAudioDeviceTransportTypeBluetooth || type == kAudioDeviceTransportTypeBluetoothLE
     }
 
-    /// The Mac's own microphone, found by transport type so it works regardless of name or language.
-    static func builtInMic() -> AudioDeviceID? {
-        allDevices().first { transportType($0) == kAudioDeviceTransportTypeBuiltIn && hasInput($0) }
+    /// The Mac's own microphone, identified by transport type so it works regardless of name or language.
+    static func isBuiltIn(_ device: AudioDeviceID) -> Bool {
+        transportType(device) == kAudioDeviceTransportTypeBuiltIn
+    }
+
+    /// Input devices backed by a real microphone. Virtual and aggregate devices (BlackHole, Zoom, etc.)
+    /// are skipped because switching to one would capture silence or something other than your voice.
+    static func microphones() -> [AudioDeviceID] {
+        let skipped: Set<UInt32> = [kAudioDeviceTransportTypeVirtual,
+                                    kAudioDeviceTransportTypeAggregate,
+                                    kAudioDeviceTransportTypeAutoAggregate]
+        return allDevices().filter { hasInput($0) && !skipped.contains(transportType($0)) }
     }
 
     static func onChange(_ selector: AudioObjectPropertySelector, _ handler: @escaping () -> Void) {
         var addr = address(selector)
         AudioObjectAddPropertyListenerBlock(system, &addr, DispatchQueue.main) { _, _ in handler() }
+    }
+}
+
+// MARK: - Lid state
+
+enum Lid {
+    /// True when a MacBook's lid is closed (e.g. running on an external display). Macs disconnect
+    /// the built-in mic in hardware while the lid is shut, so it still shows up but records silence.
+    static var isClosed: Bool {
+        let rootDomain = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard rootDomain != 0 else { return false }
+        defer { IOObjectRelease(rootDomain) }
+        let state = IORegistryEntryCreateCFProperty(rootDomain, "AppleClamshellState" as CFString,
+                                                    kCFAllocatorDefault, 0)?.takeRetainedValue()
+        return state as? Bool ?? false
     }
 }
 
@@ -139,19 +164,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         Audio.onChange(kAudioHardwarePropertyDefaultInputDevice) { [weak self] in self?.enforce() }
         Audio.onChange(kAudioHardwarePropertyDevices) { [weak self] in self?.enforce() }
+
+        // Opening or closing the lid on an external display changes the screen setup;
+        // waking from sleep can too. Either way the right mic may have changed.
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                               object: nil, queue: .main) { [weak self] _ in self?.recheckSoon() }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification,
+                                                          object: nil, queue: .main) { [weak self] _ in self?.recheckSoon() }
         enforce()
     }
 
-    /// If the default input is a Bluetooth mic, switch it back to the built-in mic.
-    private func enforce(retriesLeft: Int = 3) {
-        guard isActive,
-              let current = Audio.defaultInput(), Audio.isBluetooth(current),
-              let builtIn = Audio.builtInMic() else { return }
+    /// The lid state can update slightly after the screen change, so check a few times.
+    private func recheckSoon() {
+        for delay in [0.0, 1.0, 3.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.enforce() }
+        }
+    }
 
-        let from = Audio.name(current)
-        if Audio.setDefaultInput(builtIn) {
+    /// The mic that should replace `current`, or nil to leave it alone.
+    /// - Lid open: switch away from Bluetooth mics, preferring the built-in mic.
+    /// - Lid closed: the built-in mic records silence, so use another wired mic if there is one;
+    ///   otherwise fall back to the Bluetooth mic, because call-quality audio beats a dead mic.
+    private func replacement(for current: AudioDeviceID, lidClosed: Bool) -> AudioDeviceID? {
+        let currentIsDeadBuiltIn = lidClosed && Audio.isBuiltIn(current)
+        guard Audio.isBluetooth(current) || currentIsDeadBuiltIn else { return nil }
+
+        let mics = Audio.microphones()
+        let wired = mics.filter { !Audio.isBluetooth($0) && !(lidClosed && Audio.isBuiltIn($0)) }
+        if let mic = wired.first(where: Audio.isBuiltIn) ?? wired.first {
+            return mic
+        }
+        return currentIsDeadBuiltIn ? mics.first(where: Audio.isBluetooth) : nil
+    }
+
+    private func enforce(retriesLeft: Int = 3) {
+        let lidClosed = Lid.isClosed
+        guard isActive,
+              let current = Audio.defaultInput(),
+              let target = replacement(for: current, lidClosed: lidClosed) else { return }
+
+        if Audio.setDefaultInput(target) {
             let time = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
-            lastAction = "Switched away from \(from) at \(time)"
+            lastAction = "Switched to \(Audio.name(target)) at \(time)" + (lidClosed ? " (lid closed)" : "")
         }
 
         // macOS can re-select the headphones right after they connect, so check again shortly.
@@ -175,6 +229,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let current = Audio.defaultInput().map(Audio.name) ?? "None"
         menu.addItem(withTitle: "Microphone: \(current)", action: nil, keyEquivalent: "")
+        if Lid.isClosed {
+            menu.addItem(withTitle: "Lid closed: built-in mic is off", action: nil, keyEquivalent: "")
+        }
         if let lastAction {
             menu.addItem(withTitle: lastAction, action: nil, keyEquivalent: "")
         }
